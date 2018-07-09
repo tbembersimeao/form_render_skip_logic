@@ -20,10 +20,20 @@ use REDCap;
  * ExternalModule class for REDCap Form Render Skip Logic.
  */
 class ExternalModule extends AbstractExternalModule {
+    static protected $deniedForms;
+
+    function redcap_every_page_before_render($project_id) {
+        define('FORM_RENDER_SKIP_LOGIC_PREFIX', $this->PREFIX);
+    }
+
     /**
      * @inheritdoc
      */
     function redcap_every_page_top($project_id) {
+        if (!$project_id) {
+            return;
+        }
+
         if (strpos(PAGE, 'ExternalModules/manager/project.php') !== false) {
             $this->setJsSettings(array('modulePrefix' => $this->PREFIX, 'helperButtons' => $this->getPipingHelperButtons()));
             $this->includeJs('js/config.js');
@@ -32,23 +42,35 @@ class ExternalModule extends AbstractExternalModule {
             return;
         }
 
-        if (!$project_id || !in_array(PAGE, array('DataEntry/record_status_dashboard.php', 'DataEntry/record_home.php'))) {
-            return;
+        switch (PAGE) {
+            case 'DataEntry/record_home.php':
+                $args_order = array('pid', 'id', 'event_id', 'page');
+                break;
+
+            case 'DataEntry/record_status_dashboard.php':
+                $args_order = array('pid', 'id', 'page', 'event_id', 'instance');
+                break;
+
+            default:
+                return;
+
         }
 
-        $location = substr(PAGE, 10, strlen(PAGE) - 14);
-        $this->loadFRSL($location, $this->getNumericQueryParam('id'));
+        $this->loadBulletsHandler($args_order, $this->getNumericQueryParam('arm', 1), $this->getNumericQueryParam('id'));
     }
 
     /**
      * @inheritdoc
      */
     function redcap_data_entry_form_top($project_id, $record = null, $instrument, $event_id, $group_id = null) {
+        global $Proj;
+
         if (empty($record)) {
             $record = $this->getNumericQueryParam('id');
         }
 
-        $this->loadFRSL('data_entry_form', $record, $event_id, $instrument);
+        $this->loadBulletsHandler(array('pid', 'page', 'id', 'event_id'), $Proj->eventInfo[$event_id]['arm_num'], $record, $event_id, $instrument);
+        $this->loadButtonsHandler($record, $event_id, $instrument);
     }
 
     /**
@@ -84,8 +106,31 @@ class ExternalModule extends AbstractExternalModule {
         }
     }
 
+    function loadBulletsHandler($args_order, $arm, $record = null, $event_id = null, $form = null) {
+        $args = array_combine($args_order, array_fill(0, count($args_order), '1'));
+        $args['pid'] = PROJECT_ID;
+
+        $selectors = array();
+        foreach ($this->getDeniedForms($arm, $record, $event_id, $form) as $id => $events) {
+            $args['id'] = $id;
+
+            foreach ($events as $event_id => $forms) {
+                $args['event_id'] = $event_id;
+
+                foreach ($forms as $page) {
+                    $args['page'] = $page;
+                    $selectors[] = 'a[href^="' . APP_PATH_WEBROOT . 'DataEntry/index.php?' . http_build_query($args) . '"]';
+                }
+            }
+        }
+
+        if (!empty($selectors)) {
+            echo '<style>' . implode(', ', $selectors) . ' { display: none; }</style>';
+        }
+    }
+
     /**
-     * Gets forms access matrix.
+     * Gets access denied forms.
      *
      * @param string $arm
      *   The arm name.
@@ -98,7 +143,11 @@ class ExternalModule extends AbstractExternalModule {
      *   -- event ID
      *   --- instrument name: TRUE/FALSE
      */
-    function getFormsAccessMatrix($arm, $record = null) {
+    function getDeniedForms($arm, $record = null) {
+        if (isset(self::$deniedForms)) {
+            return self::$deniedForms;
+        }
+
         global $Proj;
 
         // Getting events of the current arm.
@@ -163,7 +212,7 @@ class ExternalModule extends AbstractExternalModule {
         }
 
         // Building forms access matrix.
-        $forms_access = array();
+        $denied_forms = array();
         foreach ($control_data as $id => $data) {
             $control_values = array();
             foreach ($control_fields as $i => $cf) {
@@ -208,10 +257,10 @@ class ExternalModule extends AbstractExternalModule {
                 $control_values[$i] = $matches;
             }
 
-            $forms_access[$id] = array();
+            $denied_forms[$id] = array();
 
             foreach ($events as $event_id) {
-                $forms_access[$id][$event] = array();
+                $denied_forms[$id][$event] = array();
 
                 foreach ($Proj->eventsForms[$event_id] as $form) {
                     $access = true;
@@ -229,12 +278,15 @@ class ExternalModule extends AbstractExternalModule {
                         }
                     }
 
-                    $forms_access[$id][$event_id][$form] = $access;
+                    if (!$access) {
+                        $denied_forms[$id][$event_id][$form] = $form;
+                    }
                 }
             }
         }
 
-        return $forms_access;
+        self::$deniedForms = $denied_forms;
+        return $denied_forms;
     }
 
     /**
@@ -253,22 +305,22 @@ class ExternalModule extends AbstractExternalModule {
      * @param string $instrument
      *   The form/instrument name.
      */
-    protected function loadFRSL($location, $record = null, $event_id = null, $instrument = null) {
+    protected function loadButtonsHandler($record = null, $event_id = null, $instrument = null) {
         global $Proj;
 
         $arm = $event_id ? $Proj->eventInfo[$event_id]['arm_num'] : $this->getNumericQueryParam('arm', 1);
         $next_step_path = '';
-        $forms_access = $this->getFormsAccessMatrix($arm, $record);
+        $denied_forms = self::$deniedForms;
 
         if ($record && $event_id && $instrument) {
             $instruments = $Proj->eventsForms[$event_id];
-            $curr_forms_access = $forms_access[$record][$event_id];
+            $curr_denied_forms = $denied_forms[$record][$event_id];
 
             $i = array_search($instrument, $instruments) + 1;
             $len = count($instruments);
 
             while ($i < $len) {
-                if ($curr_forms_access[$instruments[$i]]) {
+                if (empty($curr_denied_forms[$instruments[$i]])) {
                     $next_instrument = $instruments[$i];
                     break;
                 }
@@ -282,7 +334,7 @@ class ExternalModule extends AbstractExternalModule {
             }
 
             // Access denied to the current page.
-            if (!$forms_access[$record][$event_id][$instrument]) {
+            if (!empty($denied_forms[$record][$event_id][$instrument])) {
                 if (!$next_step_path) {
                     $next_step_path = APP_PATH_WEBROOT . 'DataEntry/record_home.php?pid=' . $Proj->project_id . '&id=' . $record . '&arm=' . $arm;
                 }
@@ -292,13 +344,7 @@ class ExternalModule extends AbstractExternalModule {
             }
         }
 
-        $settings = array(
-            'location' => $location,
-            'formsAccess' => $forms_access,
-            'nextStepPath' => $next_step_path,
-        );
-
-        $this->setJsSettings($settings);
+        $this->setJsSettings(array('nextStepPath' => $next_step_path));
         $this->includeJs('js/frsl.js');
     }
 
@@ -315,10 +361,10 @@ class ExternalModule extends AbstractExternalModule {
         global $Proj;
 
         $arm = $Proj->eventInfo[$event_id]['arm_num'];
-        $forms_access = $this->getFormsAccessMatrix($arm, $record);
+        $denied_forms = $this->getDeniedForms($arm, $record);
 
-        foreach ($forms_access[$record][$event_id] as $form => $value) {
-            if ($value || empty($Proj->forms[$form]['survey_id'])) {
+        foreach ($denied_forms[$record][$event_id] as $form) {
+            if (empty($Proj->forms[$form]['survey_id'])) {
                 continue;
             }
 
@@ -354,7 +400,7 @@ class ExternalModule extends AbstractExternalModule {
     }
 
     /**
-     * Gets numaric URL query parameter.
+     * Gets numeric URL query parameter.
      *
      * @param string $param
      *   The parameter name
@@ -366,7 +412,7 @@ class ExternalModule extends AbstractExternalModule {
      *   returned otherwise.
      */
     function getNumericQueryParam($param, $default = null) {
-        return empty($_GET[$param]) || !is_numeric($_GET[$param]) ? $default : $_GET[$param];
+        return empty($_GET[$param]) || intval($_GET[$param]) != $_GET[$param] ? $default : $_GET[$param];
     }
 
     /**
